@@ -1,6 +1,7 @@
 from bs4 import BeautifulSoup
 import urllib.parse
 import threading
+from contextlib import contextmanager
 from markdownify import markdownify as md
 import requests
 import logging
@@ -11,8 +12,19 @@ import re
 from typing import (
     List,
     Optional,
-    Union
+    Union,
+    Set
 )
+from .url_tracker import ThreadSafeURLTracker
+
+
+# Import Playwright with optional handling
+try:
+    from playwright.sync_api import sync_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+    sync_playwright = None
 __version__ = '0.1'
 __author__ = 'Paul Pierre (github.com/paulpierre)'
 __copyright__ = "(C) 2023 Paul Pierre. MIT License."
@@ -38,6 +50,7 @@ DEFAULT_TARGET_CONTENT = ['article', 'div', 'main', 'p']
 DEFAULT_TARGET_LINKS = ['body']
 DEFAULT_DOMAIN_MATCH = True
 DEFAULT_BASE_PATH_MATCH = True
+DEFAULT_RENDER_HTML = False
 
 
 # --------------
@@ -60,35 +73,99 @@ def normalize_url(url: str) -> str:
     return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path.rstrip('/'), None, None, None))
 
 
+# ---------------------
+# HTML rendering with JS
+# ---------------------
+_thread_local = threading.local()
+
+@contextmanager
+def get_browser_for_thread():
+    """Get or create a browser instance for the current thread."""
+    if not hasattr(_thread_local, 'playwright'):
+        if not PLAYWRIGHT_AVAILABLE:
+            raise ImportError('Playwright is required for HTML rendering but not installed')
+        
+        _thread_local.playwright = sync_playwright()
+        _thread_local.playwright_context = _thread_local.playwright.__enter__()
+        _thread_local.browser = _thread_local.playwright_context.firefox.launch(headless=True)
+        logger.debug(f'🚀 Launched browser for thread {threading.current_thread().ident}')
+    
+    try:
+        yield _thread_local.browser
+    finally:
+        pass  # Keep browser alive for thread reuse
+
+def cleanup_thread_browser():
+    """Clean up browser for current thread."""
+    if hasattr(_thread_local, 'browser'):
+        _thread_local.browser.close()
+        _thread_local.playwright_context.__exit__(None, None, None)
+        logger.debug(f'🗑️ Cleaned up browser for thread {threading.current_thread().ident}')
+        delattr(_thread_local, 'browser')
+        delattr(_thread_local, 'playwright_context')
+        delattr(_thread_local, 'playwright')
+
+def render_html_with_js(url: str) -> str:
+    """
+    Render HTML content using Playwright with thread-local browser reuse.
+    """
+    try:
+        with get_browser_for_thread() as browser:
+            page = browser.new_page()
+            page.set_default_timeout(30000)
+            page.goto(url, wait_until='networkidle')
+            html_content = page.content()
+            page.close()  # Close page but keep browser alive
+            logger.debug(f'✅ Successfully rendered HTML for {url}')
+            return html_content
+            
+    except Exception as e:
+        logger.error(f'❌ Error rendering HTML for {url}: {e}')
+        raise
+
+
 # ------------------
 # HTML parsing logic
 # ------------------
 def crawl(
     url: str,
     base_url: str,
-    already_crawled: set,
+    url_tracker: ThreadSafeURLTracker,  # Changed from already_crawled: set
     file_path: str,
     target_links: Union[str, List[str]] = DEFAULT_TARGET_LINKS,
     target_content: Union[str, List[str]] = None,
     valid_paths: Union[str, List[str]] = None,
     is_domain_match: Optional[bool] = DEFAULT_DOMAIN_MATCH,
     is_base_path_match: Optional[bool] = DEFAULT_BASE_PATH_MATCH,
-    is_links: Optional[bool] = False
+    is_links: Optional[bool] = False,
+    render_html: Optional[bool] = DEFAULT_RENDER_HTML
 ) -> List[str]:
 
-    if url in already_crawled:
-        return []
+    # Atomically check and mark URL as crawled
+    if not url_tracker.add_if_new(url):
+        return []  # Already crawled by another thread
+    
+    # Get HTML content either with requests or Playwright
     try:
-        logger.debug(f'Crawling: {url}')
-        response = requests.get(url)
-    except requests.exceptions.RequestException as e:
+        logger.debug(f'🕷️ Crawling: {url}')
+        if render_html:
+            html_content = render_html_with_js(url)
+            response_content_type = 'text/html'
+        else:
+            response = requests.get(url)
+            html_content = response.text
+            response_content_type = response.headers.get('Content-Type', '')
+            
+    except Exception as e:
         logger.error(f'❌ Request error for {url}: {e}')
         return []
-    if 'text/html' not in response.headers.get('Content-Type', ''):
+        
+    if 'text/html' not in response_content_type:
         logger.error(f'❌ Content not text/html for {url}')
         return []
-    already_crawled.add(url)
 
+    # Remove the old already_crawled.add(url) line since it's handled by url_tracker
+    
     # ---------------------------------
     # List of elements we want to strip
     # ---------------------------------
@@ -100,7 +177,7 @@ def crawl(
     # -------------------------------
     # Create BS4 instance for parsing
     # -------------------------------
-    soup = BeautifulSoup(response.text, 'html.parser')
+    soup = BeautifulSoup(html_content, 'html.parser')
 
     # Strip unwanted tags
     for script in soup(['script', 'style']):
@@ -120,9 +197,6 @@ def crawl(
         content = get_target_content(soup, target_content=target_content)
 
         if content:
-            # logger.error(f'❌ Empty content for {file_path}. Please check your targets skipping.')
-            # return []
-
             # --------------
             # Parse markdown
             # --------------
@@ -196,34 +270,62 @@ def get_target_links(
 ) -> List[str]:
 
     child_urls = []
+    base_parsed = urllib.parse.urlparse(base_url)
 
     # Get all urls from target_links
     for target in soup.find_all(target_links):
         # Get all the links in target
         for link in target.find_all('a'):
-            child_urls.append(urllib.parse.urljoin(base_url, link.get('href')))
+            href = link.get('href')
+            if not href:
+                continue
+            
+            # Convert relative URLs to absolute
+            full_url = urllib.parse.urljoin(base_url, href)
+            
+            # Skip invalid URLs
+            if not is_valid_url(full_url):
+                continue
+                
+            child_urls.append(full_url)
 
     result = []
-    for u in child_urls:
-
-        child_url = urllib.parse.urlparse(u)
+    for url in child_urls:
+        child_parsed = urllib.parse.urlparse(url)
 
         # ---------------------------------
         # Check if domain match is required
         # ---------------------------------
-        if is_domain_match and child_url.netloc != urllib.parse.urlparse(base_url).netloc:
+        if is_domain_match and child_parsed.netloc != base_parsed.netloc:
+            logger.debug(f'Skipping {url} - domain mismatch')
             continue
 
-        if is_base_path_match and child_url.path.startswith(urllib.parse.urlparse(base_url).path):
-            result.append(u)
+        # ---------------------------------
+        # Check if base path match is required
+        # ---------------------------------
+        if is_base_path_match and not child_parsed.path.startswith(base_parsed.path):
+            logger.debug(f'Skipping {url} - base path mismatch')
             continue
 
+        # ---------------------------------
+        # Check valid paths if specified
+        # ---------------------------------
         if valid_paths:
+            path_match = False
             for valid_path in valid_paths:
-                if child_url.path.startswith(urllib.parse.urlparse(valid_path).path):
-                    result.append(u)
+                if child_parsed.path.startswith(valid_path):
+                    path_match = True
                     break
+            if not path_match:
+                logger.debug(f'Skipping {url} - not in valid paths')
+                continue
 
+        # If we get here, the URL passed all filters
+        normalized_url = normalize_url(url)
+        if normalized_url not in result:
+            result.append(normalized_url)
+
+    logger.debug(f'Found {len(result)} valid child URLs from {len(child_urls)} total links')
     return result
 
 
@@ -241,33 +343,40 @@ def worker(
     valid_paths: Union[List[str], None] = None,
     is_domain_match: bool = None,
     is_base_path_match: bool = None,
-    is_links: Optional[bool] = False
+    is_links: Optional[bool] = False,
+    render_html: Optional[bool] = DEFAULT_RENDER_HTML
 ) -> None:
 
-    while not q.empty():
-        depth, url = q.get()
-        if depth > max_depth:
-            continue
-        file_name = '-'.join(re.findall(r'\w+', urllib.parse.urlparse(url).path))
-        file_name = 'index' if not file_name else file_name
-        file_path = f'{base_dir.rstrip("/") + "/"}{file_name}.md'
+    try:
+        while not q.empty():
+            depth, url = q.get()
+            if depth > max_depth:
+                continue
+            file_name = '-'.join(re.findall(r'\w+', urllib.parse.urlparse(url).path))
+            file_name = 'index' if not file_name else file_name
+            file_path = f'{base_dir.rstrip("/") + "/"}{file_name}.md'
 
-        child_urls = crawl(
-            url,
-            base_url,
-            already_crawled,
-            file_path,
-            target_links,
-            target_content,
-            valid_paths,
-            is_domain_match,
-            is_base_path_match,
-            is_links
-        )
-        child_urls = [normalize_url(u) for u in child_urls]
-        for child_url in child_urls:
-            q.put((depth + 1, child_url))
-        time.sleep(1)
+            child_urls = crawl(
+                url,
+                base_url,
+                already_crawled,
+                file_path,
+                target_links,
+                target_content,
+                valid_paths,
+                is_domain_match,
+                is_base_path_match,
+                is_links,
+                render_html
+            )
+            child_urls = [normalize_url(u) for u in child_urls]
+            for child_url in child_urls:
+                q.put((depth + 1, child_url))
+            time.sleep(1)
+    finally:
+        # Clean up browser when thread finishes
+        if render_html:
+            cleanup_thread_browser()
 
 
 # -----------------
@@ -284,7 +393,8 @@ def md_crawl(
         is_domain_match: Optional[bool] = None,
         is_base_path_match: Optional[bool] = None,
         is_debug: Optional[bool] = False,
-        is_links: Optional[bool] = False
+        is_links: Optional[bool] = False,
+        render_html: Optional[bool] = DEFAULT_RENDER_HTML
 ) -> None:
     if is_domain_match is False and is_base_path_match is True:
         raise ValueError('❌ Domain match must be True if base match is set to True')
@@ -320,7 +430,8 @@ def md_crawl(
     if not os.path.exists(base_dir):
         os.makedirs(base_dir)
 
-    already_crawled = set()
+    # Create thread-safe URL tracker instead of set
+    url_tracker = ThreadSafeURLTracker()
 
     # Create a queue of URLs to crawl
     q = queue.Queue()
@@ -338,14 +449,15 @@ def md_crawl(
                 q,
                 base_url,
                 max_depth,
-                already_crawled,
+                url_tracker,  # Pass url_tracker instead of already_crawled
                 base_dir,
                 target_links,
                 target_content,
                 valid_paths,
                 is_domain_match,
                 is_base_path_match,
-                is_links
+                is_links,
+                render_html
             )
         )
         threads.append(t)
@@ -356,4 +468,39 @@ def md_crawl(
     for t in threads:
         t.join()
 
-    logger.info('🏁 All threads have finished')
+    # Log final statistics
+    total_crawled = url_tracker.get_crawled_count()
+    logger.info(f'🏁 All threads finished. Total URLs crawled: {total_crawled}')
+
+# Add after the existing imports and before URL validation
+class ThreadSafeURLTracker:
+    """Thread-safe URL tracker to prevent duplicate crawling."""
+    
+    def __init__(self):
+        self._crawled: Set[str] = set()
+        self._lock = threading.Lock()
+    
+    def add_if_new(self, url: str) -> bool:
+        """
+        Add URL if new. Returns True if added, False if already existed.
+        Thread-safe operation that atomically checks and adds.
+        """
+        normalized = normalize_url(url)
+        with self._lock:
+            if normalized not in self._crawled:
+                self._crawled.add(normalized)
+                logger.debug(f'✅ Added new URL to tracker: {normalized}')
+                return True
+            logger.debug(f'⏭️ URL already crawled: {normalized}')
+            return False
+    
+    def is_crawled(self, url: str) -> bool:
+        """Check if URL has been crawled (thread-safe)."""
+        normalized = normalize_url(url)
+        with self._lock:
+            return normalized in self._crawled
+    
+    def get_crawled_count(self) -> int:
+        """Get total number of crawled URLs."""
+        with self._lock:
+            return len(self._crawled)

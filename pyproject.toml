@@ -11,11 +11,17 @@ authors = [
 ]
 description = "A multithreaded 🕸️ web crawler that recursively crawls a website and creates a 🔽 markdown file for each page"
 readme = "README.md"
-requires-python = ">=3.4"
+requires-python = ">=3.13"
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
+]
+dependencies = [
+    "bs4>=0.0.2",
+    "markdownify>=1.1.0",
+    "requests>=2.25.1",
+    "playwright>=1.40.0",
 ]
 
 [project.urls]

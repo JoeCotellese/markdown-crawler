@@ -8,6 +8,7 @@ from markdown_crawler import (
     DEFAULT_DOMAIN_MATCH,
     DEFAULT_BASE_PATH_MATCH,
     DEFAULT_TARGET_CONTENT,
+    DEFAULT_RENDER_HTML,
     BANNER
 )
 
@@ -25,6 +26,7 @@ def main():
     arg_parser.add_argument('--domain-match', '-m', action='store_true', default=DEFAULT_DOMAIN_MATCH, help='Crawl only links that match the base domain')
     arg_parser.add_argument('--base-path-match', '-p', action='store_true', default=DEFAULT_BASE_PATH_MATCH, help='Crawl only links that match the base path of the base_url specified in CLI')
     arg_parser.add_argument('--links', '-i', action='store_true', default=True, help='Enable the conversion of links in the markdown output')
+    arg_parser.add_argument('--render-html', '-r', action='store_true', default=DEFAULT_RENDER_HTML, help='Use Playwright to render JavaScript-heavy pages')
     arg_parser.add_argument('base_url', type=str, help='Base URL to crawl (ex. 🐍🎷 https://rickandmorty.fandom.com/wiki/Evil_Morty')
     if len(arg_parser.parse_args().__dict__.keys()) == 0:
         arg_parser.print_help()
@@ -45,7 +47,8 @@ def main():
         is_domain_match=args.domain_match,
         is_base_path_match=args.base_path_match,
         is_debug=args.debug,
-        is_links=args.links
+        is_links=args.links,
+        render_html=args.render_html
     )
 
 
